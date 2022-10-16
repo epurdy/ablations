@@ -15,7 +15,7 @@ def return_zero_on_index_error(fn):
         try:
             retval = fn(*args, **kwargs)
             return retval
-        except:
+        except IndexError:
             return 0
     return wrapped_fn
 
@@ -148,11 +148,12 @@ class ModelAblator:
 
     def mean_ablate_head_position_hook(self, result, hook, *,
                                        posn_idx, head_idx):
-        result[:, posn_idx, head_idx] = self.average_activations[hook.name]
+        result[:, posn_idx, head_idx] = self.average_activations[hook.name][head_idx]
         return result
 
 
     def ablate_component(self, component_name, hook):
+        self.model.cfg.use_attn_result = True
         logit_diffs = {}
         for task in self.tasks:
             task_name = task.get_name()
@@ -173,6 +174,7 @@ class ModelAblator:
                     ablated_logit_diff - clean_logit_diff
                 ).item()
 
+        self.model.cfg.use_attn_result = False
         return logit_diffs
 
     def zero_ablate_attention_layer(self, *, layer_idx):
@@ -199,7 +201,8 @@ class ModelAblator:
         return logit_diffs
 
     @return_zero_on_index_error
-    def zero_ablate_attention_head_at_posn(self, *, layer_idx, head_idx, posn_idx):
+    def zero_ablate_attention_head_at_posn(self, *, layer_idx, head_idx,
+                                           posn_idx):
         logit_diffs = self.ablate_component(
             component_name=f'blocks.{layer_idx}.attn.hook_result',
             hook=partial(self.zero_ablate_head_position_hook,
@@ -207,7 +210,7 @@ class ModelAblator:
                          posn_idx=posn_idx),
         )
         return logit_diffs
-    
+
     def zero_ablate_mlp_layer(self, *, layer_idx):
         logit_diffs = self.ablate_component(
             component_name=f'blocks.{layer_idx}.hook_mlp_out',
@@ -223,7 +226,7 @@ class ModelAblator:
                          posn_idx=posn_idx),
         )
         return logit_diffs
-    
+
     def mean_ablate_attention_layer(self, *, layer_idx):
         assert self.average_activations is not None, 'must calculate average activations before calling this function'
         logit_diffs = self.ablate_component(
@@ -242,7 +245,7 @@ class ModelAblator:
                          posn_idx=posn_idx),
         )
         return logit_diffs
-    
+
     def mean_ablate_attention_head(self, *, layer_idx, head_idx):
         assert self.average_activations is not None, 'must calculate average activations before calling this function'
         logit_diffs = self.ablate_component(
@@ -264,7 +267,7 @@ class ModelAblator:
                          posn_idx=posn_idx),
         )
         return logit_diffs
-    
+
     def mean_ablate_mlp_layer(self, *, layer_idx):
         assert self.average_activations is not None, 'must calculate average activations before calling this function'
         logit_diffs = self.ablate_component(
@@ -282,7 +285,7 @@ class ModelAblator:
                          posn_idx=posn_idx),
         )
         return logit_diffs
-    
+
     def run_mean_ablation_sweep(self):
         assert self.average_activations is not None, 'must calculate average activations before calling this function'
 
@@ -328,7 +331,7 @@ class ModelAblator:
                     max_posn,
                     len(self.model.tokenizer.encode(example)))
         print('max_posn', max_posn)
-        
+
         print('Ablating individual attention heads at all positions')
         all_head_logit_diffs = {}
         for layer_idx in tqdm.tqdm(range(self.model.cfg.n_layers)):
@@ -368,7 +371,7 @@ class ModelAblator:
             mlps=all_mlp_logit_diffs,
             attns=all_attn_logit_diffs
         )
-    
+
 
     def run_zero_ablation_sweep(self):
         assert self.average_activations is not None, 'must calculate average activations before calling this function'
@@ -413,7 +416,7 @@ class ModelAblator:
                     max_posn,
                     len(self.model.tokenizer.encode(example)))
         print('max_posn', max_posn)
-        
+
         print('Ablating individual attention heads at all positions')
         all_head_logit_diffs = {}
         for layer_idx in tqdm.tqdm(range(self.model.cfg.n_layers)):
@@ -452,23 +455,149 @@ class ModelAblator:
             mlps=all_mlp_logit_diffs,
             attns=all_attn_logit_diffs
         )
-    
-    def summarize_logit_diffs(self, logit_diffs):
+
+    def summarize_logit_diffs(self, logit_diffs, depth=10):
         scored_components = defaultdict(list)
         for component_type in logit_diffs:
             for index in logit_diffs[component_type]:
                 for task_name in logit_diffs[component_type][index]:
                     for example_key in logit_diffs[component_type][index][task_name]:
                         diff = logit_diffs[component_type][index][task_name][example_key]
-                        scored_components[task_name, example_key].append(
-                            (diff, component_type, index)
+                        scored_components[task_name,
+                                          example_key,
+                                          component_type].append(
+                            (diff, index)
                         )
 
-        for task_name, example_key in scored_components:
-            scored_components[task_name, example_key].sort()
+        for task_name, example_key, component_type in scored_components:
+            scored_components[task_name,
+                              example_key,
+                              component_type].sort()
             print('-' * 80)
             print('Task:', task_name)
             print('Example key:', example_key)
-            for i in range(10):
-                diff, typ, idx = scored_components[task_name, example_key][i]
-                print(f'Component: {typ} {idx} {diff:.3f}')
+            print('Component type:', component_type)
+            for i in range(depth):
+                diff, idx = scored_components[task_name,
+                                              example_key,
+                                              component_type][i]
+                print(f'Component: {component_type} {idx} {diff:.3f}')
+
+    def pick_interesting_logit_diffs(self, logit_diffs):
+        # rearrange the scores into a nicer format
+        scored_components = defaultdict(list)
+        for component_type in logit_diffs:
+            # skip whole attention-layers, since we have head-level
+            # data
+            if component_type == 'attns':
+                continue
+            for index in logit_diffs[component_type]:
+                for task_name in logit_diffs[component_type][index]:
+                    for example_key in logit_diffs[component_type][index][task_name]:
+                        diff = logit_diffs[component_type][index][task_name][example_key]
+                        scored_components[component_type, index].append(
+                            diff
+                        )
+
+        # score components as the minimum logit diff seen from
+        # ablating them
+        component_scores = []
+        for component_key in scored_components:
+            score = min(scored_components[component_key] + [np.inf])
+            component_scores.append((score, component_scores))
+        component_scores.sort()
+
+        for i, (score1, component_key1) in enumerate(component_scores):
+            for j, (score2, component_key2) in enumerate(component_scores):
+                if j <= i:
+                    continue
+
+                component1, index1 = component_key1
+                component2, index2 = component_key2
+
+                if component1 == 'mlps':
+                    if component2 == 'mlps':
+                        posn1, layer1 = index1
+                        posn2, layer2 = index2
+
+                        # can't do a non-trivial point-to-point
+                        # ablation if two mlps are on different tokens
+                        if posn1 != posn2
+                            continue
+
+                        assert layer1 != layer2, 'should not happen'
+
+                        if layer1 < layer2:
+                            yield (component_key1, component_key2)
+                        else:
+                            yield (component_key2, component_key1)
+
+                    elif component2 == 'heads':
+                        posn1, layer1 = index1
+                        posn2, layer2, head2 = index2
+
+                        # if mlp is after the attention head, then it
+                        # must be on the same token for a
+                        # point-to-point ablation to be non-trivial
+                        if layer1 >= layer2:
+                            if posn1 != posn2:
+                                continue
+                            yield (component_key2, component_key1)
+                        else:
+                            # mlp is before the attention head; it can
+                            # potentially be read from, if the
+                            # relevant attention value is non-zero
+                            yield (component_key1, component_key2)
+
+                    else:
+                        assert False, 'should not get here'
+                elif component1 == 'heads':
+                    if component2 == 'mlps':
+                        posn1, layer1, head1 = index1
+                        posn2, layer2 = index2
+
+                        # if mlp is after the attention head, then it
+                        # must be on the same token for a
+                        # point-to-point ablation to be non-trivial
+                        if layer2 >= layer1:
+                            if posn1 != posn2:
+                                continue
+                            yield (component_key1, component_key2)
+                        else:
+                            # mlp is before the attention head; it can
+                            # potentially be read from, if the
+                            # relevant attention value is non-zero
+                            yield (component_key2, component_key1)
+
+                    elif component2 == 'heads':
+                        posn1, layer1, head1 = index1
+                        posn2, layer2, head2 = index2
+
+                        # can't do a non-trivial point-to-point
+                        # ablation if the two heads are on the same
+                        # layer
+                        if layer1 == layer2:
+                            continue
+
+                        # because of causal masking, can only have a
+                        # non-trivial point-to-point ablation if
+                        # earlier layer is also at an earlier position
+                        # (or the same position)
+                        if layer1 < layer2 and posn1 <= posn2:
+                            yield (component_key1, component_key2)
+
+                        # reverse case
+                        elif layer2 < layer1 and posn2 <= posn1:
+                            yield (component_key2, component_key1)
+
+                        # otherwise, no non-trivial point-to-point
+                        # ablation is possible
+                        else:
+                            continue
+
+                    else:
+                        assert False, 'should not get here'
+                else:
+                    assert False, 'should not get here'
+
+        print('All done!')

@@ -1,3 +1,5 @@
+import pickle
+
 from ablations.core import ModelAblator, TaskHarness
 
 
@@ -16,13 +18,13 @@ class FirstPronounGenderTask(TaskHarness):
         self.example_text_so = (
             "Now Mary dislikes John, so she kicked him"
         )
-        
+
     def get_examples(self):
         return dict(
             because=self.example_text_because,
             so=self.example_text_so,
         )
-        
+
     def get_logit_diff(self, logits, key):
         # Takes in a batch x position x vocab tensor of logits
         if key == 'because':
@@ -56,7 +58,7 @@ class SecondPronounGenderTask(TaskHarness):
             because=self.example_text_because,
             so=self.example_text_so,
         )
-        
+
     def get_logit_diff(self, logits, key):
         # Takes in a batch x position x vocab tensor of logits
         if key == 'because':
@@ -69,23 +71,31 @@ class SecondPronounGenderTask(TaskHarness):
             assert False, f'Unknown key: `{key}`'
 
 
-def main():
+def compute_positional_mean_logit_diffs():
     ablator = ModelAblator()
     ablator.register_task(FirstPronounGenderTask(ablator))
     ablator.register_task(SecondPronounGenderTask(ablator))
     ablator.calculate_mean_activations()
 
-    mean_logit_diffs = ablator.run_mean_ablation_sweep()
-    zero_logit_diffs = ablator.run_zero_ablation_sweep()
     positional_mean_logit_diffs = ablator.run_positional_mean_ablation_sweep()
-    positional_zero_logit_diffs = ablator.run_positional_zero_ablation_sweep()
-    ablator.summarize_logit_diffs(mean_logit_diffs)
-    ablator.summarize_logit_diffs(zero_logit_diffs)
     ablator.summarize_logit_diffs(positional_mean_logit_diffs)
-    ablator.summarize_logit_diffs(positional_zero_logit_diffs)
 
-    import ipdb
-    ipdb.set_trace()
+    with open('positional_mean_logit_diffs.pkl', 'wb') as fout:
+        pickle.dump(positional_mean_logit_diffs, fout)
+
+
+def compute_point_to_point_logit_diffs():
+    ablator = ModelAblator()
+    ablator.register_task(FirstPronounGenderTask(ablator))
+    ablator.register_task(SecondPronounGenderTask(ablator))
+    ablator.calculate_mean_activations()
+
+    with open('positional_mean_logit_diffs.pkl', 'rb') as fin:
+        positional_mean_logit_diffs = pickle.load(fin)
+
+    for comp1, comp2 in ablator.pick_interesting_logit_diffs(positional_mean_logit_diffs):
+        print(comp1, comp2)
+
 
 if __name__ == '__main__':
-    main()
+    compute_point_to_point_logit_diffs()
