@@ -109,5 +109,35 @@ def compute_point_to_point_logit_diffs():
     with open('possible_connections.pkl', 'wb') as fout:
         pickle.dump(possible_connections, fout)
 
+def rank_point_to_point_logit_diffs():
+    # with open('positional_mean_logit_diffs.pkl', 'rb') as fin:
+    #     positional_mean_logit_diffs = pickle.load(fin)
+
+    with open('possible_connections.pkl', 'rb') as fin:
+        possible_connections = pickle.load(fin)
+
+    probable_connections = []
+    for score, comp1, comp2, revised_scores in possible_connections:
+        min_revised_score = 0
+        max_revised_score = 0
+        for task_name in revised_scores:
+            for example_key in revised_scores[task_name]:
+                revised_score = revised_scores[task_name][example_key]
+                min_revised_score = min(revised_score, min_revised_score)
+                max_revised_score = max(revised_score, max_revised_score)
+        if min_revised_score < -1 or max_revised_score > 1:
+            probable_connections.append(
+                (min_revised_score, max_revised_score, comp1, comp2)
+            )
+
+    probable_connections.sort()
+
+    for _, _, comp1, comp2 in probable_connections:
+        print(comp1, '->', comp2)
+
+    import ipdb
+    ipdb.set_trace()
+
+
 if __name__ == '__main__':
-    compute_point_to_point_logit_diffs()
+    rank_point_to_point_logit_diffs()
