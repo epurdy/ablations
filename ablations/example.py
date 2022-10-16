@@ -88,19 +88,26 @@ def compute_point_to_point_logit_diffs():
     ablator = ModelAblator()
     ablator.register_task(FirstPronounGenderTask(ablator))
     ablator.register_task(SecondPronounGenderTask(ablator))
-    ablator.calculate_mean_activations()
+    ablator.calculate_mean_activations(max_samples=1000)
 
     with open('positional_mean_logit_diffs.pkl', 'rb') as fin:
         positional_mean_logit_diffs = pickle.load(fin)
-        
-    for comps, _ in zip(
+
+    possible_connections = []
+    total_to_evaluate = 10_000
+    for comps, num in zip(
             ablator.pick_interesting_logit_diffs(positional_mean_logit_diffs),
-            range(10_000)):
+            range(total_to_evaluate)):
         score, comp1, comp2 = comps
-        print(score, comp1, comp2)
+        print(num, total_to_evaluate, score, comp1, comp2)
 
         revised_scores = ablator.mean_ablate_p2p(comp1, comp2)
         print('revised_scores', revised_scores)
+
+        possible_connections.append(score, comp1, comp2, revised_scores)
+
+    with open('possible_connections.pkl', 'wb') as fout:
+        pickle.dump(possible_connections, fout)
 
 if __name__ == '__main__':
     compute_point_to_point_logit_diffs()

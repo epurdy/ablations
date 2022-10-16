@@ -72,7 +72,9 @@ class ModelAblator:
 
     def calculate_mean_activations(
             self,
-            dataset_name='stas/openwebtext-10k'):
+            dataset_name='stas/openwebtext-10k',
+            max_samples=1000,
+    ):
 
         print('Calculating mean activations...')
         self.model.cfg.use_attn_result = True
@@ -100,7 +102,6 @@ class ModelAblator:
                 # This adds a hook to count a running total
                 hook.add_hook(running_total_hook, dir='fwd')
 
-        max_samples = 100
         count_samples = 0
         for batch in tqdm.tqdm(dataloader):
             tokens = self.model.tokenizer.encode(
@@ -184,8 +185,13 @@ class ModelAblator:
         cache[0] = (self.average_activations[hook.name] -
                     result[:, posn_idx])
 
-    def p2p_store_attn_in_hook(self, result, hook, *,
-                               posn_idx, cache, ln):
+    def p2p_store_attn_out_hook(self, result, hook, *,
+                                posn_idx, head_idx, cache):
+        cache[0] = (self.average_activations[hook.name] -
+                    result[:, posn_idx, head_idx])
+
+    def p2p_store_alternate_input_hook(self, result, hook, *,
+                                       posn_idx, cache, ln):
         ln_result = ln(result)
         ln_result[:, posn_idx] = ln(result[:, posn_idx] + cache[0])
         cache[1] = ln_result
@@ -198,23 +204,41 @@ class ModelAblator:
         result[:, posn_idx, head_idx] = new_output[:, posn_idx, head_idx]
         return result
 
+    def p2p_ablate_mlp_hook(self, result, hook, *,
+                            posn_idx,
+                            mlp, cache):
+        new_input = cache[1]
+        new_output = self.compute_mlp(mlp=mlp, input_=new_input)
+        result[:, posn_idx] = new_output[:, posn_idx]
+        return result
+
+    def compute_mlp(self, mlp, input_):
+        # Technically, all these einsums could be done with a single matmul, but this is more readable.
+        pre_act = einsum("batch pos d_model, d_model d_mlp -> batch pos d_mlp", input_, mlp.W_in) + mlp.b_in
+        post_act = mlp.act_fn(pre_act)  # [batch, pos, d_mlp]
+        assert not mlp.cfg.act_fn.endswith("_ln")
+        mlp_out = (
+            einsum("batch pos d_mlp, d_mlp d_model -> batch pos d_model", post_act, mlp.W_out) + mlp.b_out
+        )  # [batch, pos, d_model]
+        return mlp_out
+
     def compute_attn(self, attn, input_):
-        # [batch, pos, head_index, d_head]        
+        # [batch, pos, head_index, d_head]
         q = einsum("batch pos d_model, head_index d_model d_head \
-                    -> batch pos head_index d_head", 
-                   input_, attn.W_Q) + attn.b_Q 
-        # [batch, pos, head_index, d_head]        
+                    -> batch pos head_index d_head",
+                   input_, attn.W_Q) + attn.b_Q
+        # [batch, pos, head_index, d_head]
         k = einsum("batch pos d_model, head_index d_model d_head \
-                    -> batch pos head_index d_head", 
+                    -> batch pos head_index d_head",
                    input_, attn.W_K) + attn.b_K
         # [batch, pos, head_index, d_head]
         v = einsum("batch pos d_model, head_index d_model d_head \
-                    -> batch pos head_index d_head", 
+                    -> batch pos head_index d_head",
                    input_, attn.W_V) + attn.b_V
         attn_scores = (
             einsum("batch query_pos head_index d_head, \
                 batch key_pos head_index d_head \
-                -> batch head_index query_pos key_pos", 
+                -> batch head_index query_pos key_pos",
                    q, k) / attn.attn_scale
         )  # [batch, head_index, query_pos, key_pos]
 
@@ -222,7 +246,7 @@ class ModelAblator:
             # If causal attention, we mask it to only attend
             # backwards. If bidirectional, we don't mask.
             attn_scores = attn.apply_causal_mask(
-                attn_scores, 
+                attn_scores,
                 0
             ) # [batch, head_index, query_pos, key_pos]
 
@@ -232,29 +256,35 @@ class ModelAblator:
         # [batch, pos, head_index, d_head]
         z = einsum("batch key_pos head_index d_head, \
                 batch head_index query_pos key_pos -> \
-                batch query_pos head_index d_head", 
+                batch query_pos head_index d_head",
                 v, attn_matrix)
 
-        # [batch, pos, head_index, d_model]        
+        # [batch, pos, head_index, d_model]
         result = einsum("batch pos head_index d_head, \
                         head_index d_head d_model -> \
-                        batch pos head_index d_model", 
-                        z, 
+                        batch pos head_index d_model",
+                        z,
                         attn.W_O)
 
         return result
 
-        
+
     def mean_ablate_p2p(self, component_key1, component_key2):
         component1, index1 = component_key1
         component2, index2 = component_key2
 
         fwd_hooks = []
         p2p_cache = {}
-        
+
         if component1 == 'heads':
-            assert False, 'not implemented yet'
-            #fwd_hooks.append()
+            posn_idx1, layer_idx1, head_idx1 = index1
+            fwd_hooks.append(
+                (f'blocks.{layer_idx1}.hook_attn_out',
+                 partial(self.p2p_store_attn_out_hook, posn_idx=posn_idx1,
+                         head_idx=head_idx1,
+                         cache=p2p_cache))
+            )
+
         else:
             assert component1 == 'mlps'
             posn_idx1, layer_idx1 = index1
@@ -268,7 +298,7 @@ class ModelAblator:
             posn_idx2, layer_idx2, head_idx2 = index2
             fwd_hooks.append(
                 (f'blocks.{layer_idx2}.hook_resid_pre',
-                 partial(self.p2p_store_attn_in_hook,
+                 partial(self.p2p_store_alternate_input_hook,
                          posn_idx=posn_idx1,
                          ln=self.model.blocks[layer_idx2].ln1,
                          cache=p2p_cache))
@@ -281,17 +311,35 @@ class ModelAblator:
                          attn=self.model.blocks[layer_idx2].attn,
                          cache=p2p_cache))
             )
-                
+
         else:
             assert component2 == 'mlps'
-            assert False, 'not implemented yet'
-        
+            posn_idx2, layer_idx2 = index2
+            assert posn_idx1 == posn_idx2
+            fwd_hooks.append(
+                (f'blocks.{layer_idx2}.hook_resid_mid',
+                 partial(self.p2p_store_alternate_input_hook,
+                         posn_idx=posn_idx1,
+                         ln=self.model.blocks[layer_idx2].ln2,
+                         cache=p2p_cache))
+            )
+            fwd_hooks.append(
+                (f'blocks.{layer_idx2}.hook_mlp_out',
+                 partial(self.p2p_ablate_mlp_hook,
+                         posn_idx=posn_idx2,
+                         mlp=self.model.blocks[layer_idx2].mlp,
+                         cache=p2p_cache))
+            )
+
+
         self.model.cfg.use_attn_result = True
         logit_diffs = {}
         for task in self.tasks:
             task_name = task.get_name()
             logit_diffs[task_name] = {}
             for key, sentence in task.get_examples().items():
+                for p2p_key in list(p2p_cache.keys()):
+                    del p2p_cache[p2p_key]
                 clean_logits = self.model(sentence)
                 ablated_logits = self.model.run_with_hooks(
                     sentence,
@@ -308,7 +356,7 @@ class ModelAblator:
 
         self.model.cfg.use_attn_result = False
         return logit_diffs
-        
+
     def zero_ablate_attention_layer(self, *, layer_idx):
         logit_diffs = self.ablate_component(
             component_name=f'blocks.{layer_idx}.hook_attn_out',
@@ -761,4 +809,3 @@ class ModelAblator:
         scored_pairs.sort()
         for score, component_key1, component_key2  in scored_pairs:
             yield score, component_key1, component_key2
-
