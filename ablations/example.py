@@ -104,7 +104,7 @@ def compute_point_to_point_logit_diffs():
         revised_scores = ablator.mean_ablate_p2p(comp1, comp2)
         print('revised_scores', revised_scores)
 
-        possible_connections.append(score, comp1, comp2, revised_scores)
+        possible_connections.append((score, comp1, comp2, revised_scores))
 
     with open('possible_connections.pkl', 'wb') as fout:
         pickle.dump(possible_connections, fout)

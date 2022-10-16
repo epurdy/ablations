@@ -736,7 +736,12 @@ class ModelAblator:
                         else:
                             # mlp is before the attention head; it can
                             # potentially be read from, if the
-                            # relevant attention value is non-zero
+                            # relevant attention value is non-zero and
+                            # the mlp is within the causal window of
+                            # the attention head
+                            if posn1 >= posn2:
+                                continue
+
                             scored_pairs.append(
                                 ((score1 + score2),
                                  component_key1,
