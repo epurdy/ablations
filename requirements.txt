@@ -1,3 +1,7 @@
 datasets
+ipdb
+ipython
+matplotlib
+plotly
 torch
 git+https://github.com/neelnanda-io/Easy-Transformer.git
