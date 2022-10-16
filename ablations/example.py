@@ -92,10 +92,15 @@ def compute_point_to_point_logit_diffs():
 
     with open('positional_mean_logit_diffs.pkl', 'rb') as fin:
         positional_mean_logit_diffs = pickle.load(fin)
+        
+    for comps, _ in zip(
+            ablator.pick_interesting_logit_diffs(positional_mean_logit_diffs),
+            range(10_000)):
+        score, comp1, comp2 = comps
+        print(score, comp1, comp2)
 
-    for comp1, comp2 in ablator.pick_interesting_logit_diffs(positional_mean_logit_diffs):
-        print(comp1, comp2)
-
+        revised_scores = ablator.mean_ablate_p2p(comp1, comp2)
+        print('revised_scores', revised_scores)
 
 if __name__ == '__main__':
     compute_point_to_point_logit_diffs()

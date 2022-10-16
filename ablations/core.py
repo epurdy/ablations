@@ -5,9 +5,12 @@ from functools import partial
 
 import datasets
 import einops
+import numpy as np
 import torch
+import torch.nn.functional as F
 import tqdm
 from easy_transformer import EasyTransformer
+from fancy_einsum import einsum
 
 
 def return_zero_on_index_error(fn):
@@ -97,7 +100,7 @@ class ModelAblator:
                 # This adds a hook to count a running total
                 hook.add_hook(running_total_hook, dir='fwd')
 
-        max_samples = 1000
+        max_samples = 100
         count_samples = 0
         for batch in tqdm.tqdm(dataloader):
             tokens = self.model.tokenizer.encode(
@@ -177,6 +180,135 @@ class ModelAblator:
         self.model.cfg.use_attn_result = False
         return logit_diffs
 
+    def p2p_store_mlp_out_hook(self, result, hook, *, posn_idx, cache):
+        cache[0] = (self.average_activations[hook.name] -
+                    result[:, posn_idx])
+
+    def p2p_store_attn_in_hook(self, result, hook, *,
+                               posn_idx, cache, ln):
+        ln_result = ln(result)
+        ln_result[:, posn_idx] = ln(result[:, posn_idx] + cache[0])
+        cache[1] = ln_result
+
+    def p2p_ablate_head_hook(self, result, hook, *,
+                             posn_idx, head_idx,
+                             attn, cache):
+        new_input = cache[1]
+        new_output = self.compute_attn(attn=attn, input_=new_input)
+        result[:, posn_idx, head_idx] = new_output[:, posn_idx, head_idx]
+        return result
+
+    def compute_attn(self, attn, input_):
+        # [batch, pos, head_index, d_head]        
+        q = einsum("batch pos d_model, head_index d_model d_head \
+                    -> batch pos head_index d_head", 
+                   input_, attn.W_Q) + attn.b_Q 
+        # [batch, pos, head_index, d_head]        
+        k = einsum("batch pos d_model, head_index d_model d_head \
+                    -> batch pos head_index d_head", 
+                   input_, attn.W_K) + attn.b_K
+        # [batch, pos, head_index, d_head]
+        v = einsum("batch pos d_model, head_index d_model d_head \
+                    -> batch pos head_index d_head", 
+                   input_, attn.W_V) + attn.b_V
+        attn_scores = (
+            einsum("batch query_pos head_index d_head, \
+                batch key_pos head_index d_head \
+                -> batch head_index query_pos key_pos", 
+                   q, k) / attn.attn_scale
+        )  # [batch, head_index, query_pos, key_pos]
+
+        if attn.cfg.attention_dir == 'causal':
+            # If causal attention, we mask it to only attend
+            # backwards. If bidirectional, we don't mask.
+            attn_scores = attn.apply_causal_mask(
+                attn_scores, 
+                0
+            ) # [batch, head_index, query_pos, key_pos]
+
+        # [batch, head_index, query_pos, key_pos]
+        attn_matrix = F.softmax(attn_scores, dim=-1)
+
+        # [batch, pos, head_index, d_head]
+        z = einsum("batch key_pos head_index d_head, \
+                batch head_index query_pos key_pos -> \
+                batch query_pos head_index d_head", 
+                v, attn_matrix)
+
+        # [batch, pos, head_index, d_model]        
+        result = einsum("batch pos head_index d_head, \
+                        head_index d_head d_model -> \
+                        batch pos head_index d_model", 
+                        z, 
+                        attn.W_O)
+
+        return result
+
+        
+    def mean_ablate_p2p(self, component_key1, component_key2):
+        component1, index1 = component_key1
+        component2, index2 = component_key2
+
+        fwd_hooks = []
+        p2p_cache = {}
+        
+        if component1 == 'heads':
+            assert False, 'not implemented yet'
+            #fwd_hooks.append()
+        else:
+            assert component1 == 'mlps'
+            posn_idx1, layer_idx1 = index1
+            fwd_hooks.append(
+                (f'blocks.{layer_idx1}.hook_mlp_out',
+                 partial(self.p2p_store_mlp_out_hook, posn_idx=posn_idx1,
+                         cache=p2p_cache))
+            )
+
+        if component2 == 'heads':
+            posn_idx2, layer_idx2, head_idx2 = index2
+            fwd_hooks.append(
+                (f'blocks.{layer_idx2}.hook_resid_pre',
+                 partial(self.p2p_store_attn_in_hook,
+                         posn_idx=posn_idx1,
+                         ln=self.model.blocks[layer_idx2].ln1,
+                         cache=p2p_cache))
+            )
+            fwd_hooks.append(
+                (f'blocks.{layer_idx2}.attn.hook_result',
+                 partial(self.p2p_ablate_head_hook,
+                         posn_idx=posn_idx2,
+                         head_idx=head_idx2,
+                         attn=self.model.blocks[layer_idx2].attn,
+                         cache=p2p_cache))
+            )
+                
+        else:
+            assert component2 == 'mlps'
+            assert False, 'not implemented yet'
+        
+        self.model.cfg.use_attn_result = True
+        logit_diffs = {}
+        for task in self.tasks:
+            task_name = task.get_name()
+            logit_diffs[task_name] = {}
+            for key, sentence in task.get_examples().items():
+                clean_logits = self.model(sentence)
+                ablated_logits = self.model.run_with_hooks(
+                    sentence,
+                    fwd_hooks=fwd_hooks,
+                )
+                self.model.reset_hooks()
+                clean_logit_diff = task.get_logit_diff(
+                    logits=clean_logits, key=key)
+                ablated_logit_diff = task.get_logit_diff(
+                    logits=ablated_logits, key=key)
+                logit_diffs[task_name][key] = (
+                    ablated_logit_diff - clean_logit_diff
+                ).item()
+
+        self.model.cfg.use_attn_result = False
+        return logit_diffs
+        
     def zero_ablate_attention_layer(self, *, layer_idx):
         logit_diffs = self.ablate_component(
             component_name=f'blocks.{layer_idx}.hook_attn_out',
@@ -504,9 +636,10 @@ class ModelAblator:
         component_scores = []
         for component_key in scored_components:
             score = min(scored_components[component_key] + [np.inf])
-            component_scores.append((score, component_scores))
+            component_scores.append((score, component_key))
         component_scores.sort()
 
+        scored_pairs = []
         for i, (score1, component_key1) in enumerate(component_scores):
             for j, (score2, component_key2) in enumerate(component_scores):
                 if j <= i:
@@ -522,15 +655,21 @@ class ModelAblator:
 
                         # can't do a non-trivial point-to-point
                         # ablation if two mlps are on different tokens
-                        if posn1 != posn2
+                        if posn1 != posn2:
                             continue
 
                         assert layer1 != layer2, 'should not happen'
 
                         if layer1 < layer2:
-                            yield (component_key1, component_key2)
+                            scored_pairs.append(
+                                ((score1 + score2),
+                                 component_key1,
+                                 component_key2))
                         else:
-                            yield (component_key2, component_key1)
+                            scored_pairs.append(
+                                ((score1 + score2),
+                                 component_key2,
+                                 component_key1))
 
                     elif component2 == 'heads':
                         posn1, layer1 = index1
@@ -542,12 +681,18 @@ class ModelAblator:
                         if layer1 >= layer2:
                             if posn1 != posn2:
                                 continue
-                            yield (component_key2, component_key1)
+                            scored_pairs.append(
+                                ((score1 + score2),
+                                 component_key2,
+                                 component_key1))
                         else:
                             # mlp is before the attention head; it can
                             # potentially be read from, if the
                             # relevant attention value is non-zero
-                            yield (component_key1, component_key2)
+                            scored_pairs.append(
+                                ((score1 + score2),
+                                 component_key1,
+                                 component_key2))
 
                     else:
                         assert False, 'should not get here'
@@ -562,12 +707,18 @@ class ModelAblator:
                         if layer2 >= layer1:
                             if posn1 != posn2:
                                 continue
-                            yield (component_key1, component_key2)
+                            scored_pairs.append(
+                                ((score1 + score2),
+                                 component_key1,
+                                 component_key2))
                         else:
                             # mlp is before the attention head; it can
                             # potentially be read from, if the
                             # relevant attention value is non-zero
-                            yield (component_key2, component_key1)
+                            scored_pairs.append(
+                                ((score1 + score2),
+                                 component_key2,
+                                 component_key1))
 
                     elif component2 == 'heads':
                         posn1, layer1, head1 = index1
@@ -584,11 +735,17 @@ class ModelAblator:
                         # earlier layer is also at an earlier position
                         # (or the same position)
                         if layer1 < layer2 and posn1 <= posn2:
-                            yield (component_key1, component_key2)
+                            scored_pairs.append(
+                                ((score1 + score2),
+                                 component_key1,
+                                 component_key2))
 
                         # reverse case
                         elif layer2 < layer1 and posn2 <= posn1:
-                            yield (component_key2, component_key1)
+                            scored_pairs.append(
+                                ((score1 + score2),
+                                 component_key2,
+                                 component_key1))
 
                         # otherwise, no non-trivial point-to-point
                         # ablation is possible
@@ -601,3 +758,7 @@ class ModelAblator:
                     assert False, 'should not get here'
 
         print('All done!')
+        scored_pairs.sort()
+        for score, component_key1, component_key2  in scored_pairs:
+            yield score, component_key1, component_key2
+
