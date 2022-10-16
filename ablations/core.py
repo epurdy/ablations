@@ -14,6 +14,7 @@ def return_zero_on_index_error(fn):
     def wrapped_fn(*args, **kwargs):
         try:
             retval = fn(*args, **kwargs)
+            return retval
         except:
             return 0
     return wrapped_fn
@@ -328,7 +329,7 @@ class ModelAblator:
                     len(self.model.tokenizer.encode(example)))
         print('max_posn', max_posn)
         
-        print('Ablating individual attention heads')
+        print('Ablating individual attention heads at all positions')
         all_head_logit_diffs = {}
         for layer_idx in tqdm.tqdm(range(self.model.cfg.n_layers)):
             for head_idx in range(self.model.cfg.n_heads):
@@ -341,7 +342,7 @@ class ModelAblator:
                         logit_diffs
                     )
 
-        print('Ablating attention layers')
+        print('Ablating attention layers at all positions')
         all_attn_logit_diffs = {}
         for layer_idx in tqdm.tqdm(range(self.model.cfg.n_layers)):
             for posn_idx in range(max_posn):
@@ -352,7 +353,7 @@ class ModelAblator:
                 all_attn_logit_diffs[posn_idx, layer_idx] = logit_diffs
 
 
-        print('Ablating MLP layers')
+        print('Ablating MLP layers at all positions')
         all_mlp_logit_diffs = {}
         for layer_idx in tqdm.tqdm(range(self.model.cfg.n_layers)):
             for posn_idx in range(max_posn):
@@ -413,7 +414,7 @@ class ModelAblator:
                     len(self.model.tokenizer.encode(example)))
         print('max_posn', max_posn)
         
-        print('Ablating individual attention heads')
+        print('Ablating individual attention heads at all positions')
         all_head_logit_diffs = {}
         for layer_idx in tqdm.tqdm(range(self.model.cfg.n_layers)):
             for head_idx in range(self.model.cfg.n_heads):
@@ -426,7 +427,7 @@ class ModelAblator:
                         logit_diffs
                     )
 
-        print('Ablating attention layers')
+        print('Ablating attention layers at all positions')
         all_attn_logit_diffs = {}
         for layer_idx in tqdm.tqdm(range(self.model.cfg.n_layers)):
             for posn_idx in range(max_posn):
@@ -436,7 +437,7 @@ class ModelAblator:
                 )
                 all_attn_logit_diffs[posn_idx, layer_idx] = logit_diffs
 
-        print('Ablating MLP layers')
+        print('Ablating MLP layers at all positions')
         all_mlp_logit_diffs = {}
         for layer_idx in tqdm.tqdm(range(self.model.cfg.n_layers)):
             for posn_idx in range(max_posn):
